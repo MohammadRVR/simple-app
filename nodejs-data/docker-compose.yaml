@@ -1,0 +1,151 @@
+version: "3.8"
+
+services:
+  nodeapp:
+    image: docker.io/thamarana/nodeapp-v5:2.0
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./data/logs:/app/logs
+  # ms-db-server:
+  #   image: mcr.microsoft.com/mssql/server
+  #   environment: 
+  #     - SA_PASSWORD=P@ssw0rd
+  #     - ACCEPT_EULA=Y
+  #   volumes:
+  #     - ./data/db/mssql/scripts:/scripts/
+  #   ports:
+  #     - "1433:1433"
+  #   #entrypoint: /bin/bash
+  #   command:
+  #     - /bin/bash
+  #     - -c
+  #     - |
+  #       /opt/mssql/bin/sqlservr &
+  #       pid=$$!
+
+  #       echo "Waiting for MS SQL to be available ⏳"
+  #       /opt/mssql-tools/bin/sqlcmd -l 30 -S localhost -h-1 -V1 -U sa -P $$SA_PASSWORD -Q "SET NOCOUNT ON SELECT \"YAY WE ARE UP\" , @@servername"
+  #       is_up=$$?
+  #       while [ $$is_up -ne 0 ] ; do
+  #         echo -e $$(date)
+  #         /opt/mssql-tools/bin/sqlcmd -l 30 -S localhost -h-1 -V1 -U sa -P $$SA_PASSWORD -Q "SET NOCOUNT ON SELECT \"YAY WE ARE UP\" , @@servername"
+  #         is_up=$$?
+  #         sleep 5
+  #       done
+
+  #       for foo in /scripts/*.sql
+  #         do /opt/mssql-tools/bin/sqlcmd -U sa -P $$SA_PASSWORD -l 30 -e -i $$foo
+  #       done
+  #       echo "All scripts have been executed. Waiting for MS SQL(pid $$pid) to terminate."
+
+  #       wait $$pid
+
+  tempo:
+    image: grafana/tempo:2.1.1
+    command: ["-config.file=/etc/tempo.yaml"]
+    volumes:
+      - ./etc/tempo-local.yaml:/etc/tempo.yaml
+      - ./data/tempo-data:/tmp/tempo
+    ports:
+      - "14268:14268"      # jaeger ingest, Jaeger - Thrift HTTP
+      - "14250:14250"      # Jaeger - GRPC
+      - "55680:55680"      # OpenTelemetry
+      - "3100:3100"       # tempo
+      - "6831:6831/udp"   # Jaeger - Thrift Compact
+      - "6832:6832/udp"   # Jaeger - Thrift Binary	
+
+  tempo-query:
+    image: grafana/tempo-query
+    command: ["--grpc-storage-plugin.configuration-file=/etc/tempo-query.yaml"]
+    volumes:
+      - ./etc/tempo-query.yaml:/etc/tempo-query.yaml
+    ports:
+      - "16686:16686"  # jaeger-ui
+    depends_on:
+      - tempo
+
+  loki:
+    image: grafana/loki:2.8.2
+    command: -config.file=/etc/loki/loki-local.yaml
+    ports:
+      - "3101:3100"                                   # loki needs to be exposed so it receives logs
+    environment:
+      - JAEGER_AGENT_HOST=tempo
+      - JAEGER_ENDPOINT=http://tempo:14268/api/traces # send traces to Tempo
+      - JAEGER_SAMPLER_TYPE=const
+      - JAEGER_SAMPLER_PARAM=1
+      - OTEL_EXPORTER_OTLP_ENDPOINT=http://tempo:4317/api/traces
+    volumes:
+      - ./etc/loki-local.yaml:/etc/loki/loki-local.yaml
+      - ./data/loki-data:/tmp/loki
+
+  # nodejs-otel-tempo-api:
+  #   build: .
+  #   command: './wait-for.sh ms-db-server:1433 -- node ./dist/server.js'
+  #   ports:
+  #     - "5555:5555"
+  #   environment:
+  #     - OTEL_EXPORTER_JAEGER_ENDPOINT=http://tempo:14268/api/traces
+  #     - OTEL_SERVICE_NAME=nodejs-opentelemetry-tempo
+  #     # - LOG_FILE_NAME=/app/logs/nodejs-opentelemetry-tempo.log
+  #     # - DB_USER=sa
+  #     # - DB_PASS=P@ssw0rd
+  #     # - DB_SERVER=ms-db-server
+  #     # - DB_NAME=OtelTempo
+  #   volumes:
+  #     - ./data/logs:/app/logs
+  #     - ./etc/wait-for.sh:/app/bin/wait-for.sh   #https://github.com/eficode/wait-for
+  #   depends_on:
+  #     - ms-db-server
+  #     - tempo-query
+
+  promtail:
+    image: grafana/promtail:2.7.0
+    command: -config.file=/etc/promtail/promtail-local.yaml
+    volumes:
+      - ./etc/promtail-local.yaml:/etc/promtail/promtail-local.yaml
+      - ./data/logs:/app/logs
+    depends_on:
+      # - nodejs-otel-tempo-api
+      - loki
+
+  volume_exporter:
+    image: mnadeem/volume_exporter
+    command: ["--volume-dir=tempo:/tmp/tempo", "--volume-dir=logs:/app/logs", "--volume-dir=loki:/tmp/loki"]
+    volumes:
+      - ./data/logs:/app/logs
+      - ./data/tempo-data:/tmp/tempo
+      - ./data/loki-data:/tmp/loki
+    ports:
+      - 9889:9888
+
+  prometheus:
+    image: prom/prometheus:latest
+    volumes:
+      - ./etc/prometheus.yaml:/etc/prometheus.yaml
+    entrypoint:
+      - /bin/prometheus
+      - --config.file=/etc/prometheus.yaml
+    ports:
+      - "9090:9090"
+    # depends_on:
+    #   - nodejs-otel-tempo-api
+
+  grafana:
+    image: grafana/grafana:9.5.2
+    volumes:
+      - ./data/grafana-data/datasources:/etc/grafana/provisioning/datasources
+      - ./data/grafana-data/dashboards-provisioning:/etc/grafana/provisioning/dashboards
+      - ./data/grafana-data/dashboards:/var/lib/grafana/dashboards
+    environment:
+      - GF_AUTH_ANONYMOUS_ENABLED=true
+      - GF_AUTH_ANONYMOUS_ORG_ROLE=Admin
+      - GF_AUTH_DISABLE_LOGIN_FORM=true
+    ports:
+      - "3000:3000"
+    depends_on:
+      - prometheus
+      - tempo-query
+      - loki
+      - volume_exporter
